@@ -186,6 +186,7 @@ async def test_unchanged_paired_configuration_does_not_restart_listeners(tmp_pat
 @pytest.mark.asyncio
 async def test_device_cleanup_cancels_playback_tasks_even_if_disconnect_fails():
     from types import SimpleNamespace
+
     from iSponsorBlockTV.main import DeviceListener
 
     async def disconnect():
