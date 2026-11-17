@@ -32,7 +32,11 @@ def _string(value, field, required=False):
 
 
 def _number(value, field, minimum=None):
-    if type(value) not in (int, float) or not math.isfinite(value):
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
         raise ValueError(f"{field} must be a finite number")
     if minimum is not None and value < minimum:
         raise ValueError(f"{field} must be at least {minimum}")

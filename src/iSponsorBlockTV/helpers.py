@@ -43,22 +43,24 @@ class Config:
 
         self.__load()
 
-    def validate(self):
-        from .config_store import normalize_config
-
+    def to_dict(self):
         document = {
             key: value
             for key, value in self.__dict__.items()
             if key not in config_file_blacklist_keys
         }
-        # validate() also supports repeated calls without converting offsets twice.
         document["devices"] = [
             {**device.__dict__, "offset": device.offset * 1000}
             if isinstance(device, Device)
             else device
             for device in self.devices
         ]
-        normalized = normalize_config(document)
+        return document
+
+    def validate(self):
+        from .config_store import normalize_config
+
+        normalized = normalize_config(self.to_dict())
         self.__dict__.update(normalized)
         self.devices = [Device(device) for device in normalized["devices"]]
 
@@ -70,26 +72,14 @@ class Config:
     def save(self):
         from .config_store import write_config
 
-        document = {
-            key: value
-            for key, value in self.__dict__.items()
-            if key not in config_file_blacklist_keys
-        }
-        document["devices"] = [
-            {**device.__dict__, "offset": device.offset * 1000}
-            if isinstance(device, Device)
-            else device
-            for device in self.devices
-        ]
-        write_config(self.config_file, document)
+        write_config(self.config_file, self.to_dict())
 
     def __eq__(self, other):
-        if isinstance(other, Config):
-            return self.__dict__ == other.__dict__
-        return False
+        if not isinstance(other, Config):
+            return NotImplemented
+        return self.data_dir == other.data_dir and self.to_dict() == other.to_dict()
 
-    def __hash__(self):
-        return hash(tuple(sorted(self.items())))
+    __hash__ = None
 
 
 @click.group(invoke_without_command=True)

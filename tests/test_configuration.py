@@ -159,3 +159,25 @@ def test_defaults_are_independent():
     config = normalize_config({})
     config["devices"].append({})
     assert normalize_config({})["devices"] == []
+
+
+@pytest.mark.asyncio
+async def test_unchanged_paired_configuration_does_not_restart_listeners(tmp_path):
+    write_config(tmp_path / "config.json", {"devices": [{"screen_id": "tv", "offset": 250}]})
+    config = Config(str(tmp_path))
+    config.validate()
+    candidate = Config(str(tmp_path))
+    candidate.validate()
+    assert config == candidate
+    waiter = asyncio.create_task(wait_for_config(config, interval=0.01))
+    try:
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        config.save()  # Identical content written through an atomic replacement.
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        write_config(tmp_path / "config.json", {"devices": [{"screen_id": "tv", "offset": 300}]})
+        assert (await asyncio.wait_for(waiter, timeout=1)).devices[0].offset == 0.3
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
