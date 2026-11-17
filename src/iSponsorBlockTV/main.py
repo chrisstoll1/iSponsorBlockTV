@@ -125,13 +125,6 @@ class DeviceListener:
 
     async def cancel(self):
         self.cancelled = True
-        await self.lounge_controller.disconnect()
-        if self.task:
-            self.task.cancel()
-        if self.lounge_controller.subscribe_task_watchdog:
-            self.lounge_controller.subscribe_task_watchdog.cancel()
-        if self.lounge_controller.subscribe_task:
-            self.lounge_controller.subscribe_task.cancel()
         pending = [
             task
             for task in (
@@ -141,7 +134,10 @@ class DeviceListener:
             )
             if task is not None
         ]
+        for task in pending:
+            task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        await self.lounge_controller.disconnect()
 
     async def initialize_web_session(self):
         await self.lounge_controller.change_web_session(self.web_session)

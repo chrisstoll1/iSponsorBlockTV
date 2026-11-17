@@ -181,3 +181,23 @@ async def test_unchanged_paired_configuration_does_not_restart_listeners(tmp_pat
     finally:
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_device_cleanup_cancels_playback_tasks_even_if_disconnect_fails():
+    from types import SimpleNamespace
+    from iSponsorBlockTV.main import DeviceListener
+
+    async def disconnect():
+        raise asyncio.CancelledError()
+
+    tasks = [asyncio.create_task(asyncio.Event().wait()) for _ in range(3)]
+    device = object.__new__(DeviceListener)
+    device.task = tasks[0]
+    device.lounge_controller = SimpleNamespace(
+        subscribe_task_watchdog=tasks[1], subscribe_task=tasks[2], disconnect=disconnect
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await device.cancel()
+    assert device.cancelled
+    assert all(task.cancelled() for task in tasks)
