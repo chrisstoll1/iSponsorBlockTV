@@ -1,8 +1,6 @@
-import json
 import logging
 import os
 import sys
-import time
 
 import rich_click as click
 from appdirs import user_data_dir
@@ -27,6 +25,15 @@ class Device:
     def __validate(self):
         if not self.screen_id:
             raise ValueError("No screen id found")
+        if len(self.screen_id) == 26:
+            logging.getLogger().warning(
+                "The screen id %s is 26 characters long, which is the old format.YouTube is "
+                "revoking the old format screen ids; it's likely that this device has stopped "
+                "working or will stop working soon. Pair the device again to get the new id. "
+                "Please read this for more information on how to do so and what this means: "
+                f"{github_wiki_base_url}/new-screen-ID-format",
+                self.screen_id,
+            )
 
 
 class Config:
@@ -34,84 +41,47 @@ class Config:
         self.data_dir = data_dir
         self.config_file = data_dir + "/config.json"
 
-        self.devices = []
-        self.apikey = ""
-        self.skip_categories = []  # These are the categories on the config file
-        self.channel_whitelist = []
-        self.skip_count_tracking = True
-        self.mute_ads = False
-        self.skip_ads = False
-        self.minimum_skip_length = 1
-        self.auto_play = True
-        self.join_name = "iSponsorBlockTV"
-        self.use_proxy = False
         self.__load()
 
     def validate(self):
-        if hasattr(self, "atvs"):
-            print(
-                (
-                    "The atvs config option is deprecated and has stopped working."
-                    " Please read this for more information "
-                    "on how to upgrade to V2:\n"
-                    f"{github_wiki_base_url}/Migrate-from-V1-to-V2"
-                ),
-            )
-            # Raise error to stop starting, but don't exit if it's a reload
-            raise ValueError("Deprecated 'atvs' config option present.")
-        if not self.devices:
-            print("No devices found, please add at least one device")
-        self.devices = [Device(i) for i in self.devices]
-        if not self.apikey and self.channel_whitelist:
-            raise ValueError("No youtube API key found and channel whitelist is not empty")
-        if not self.skip_categories:
-            self.skip_categories = ["sponsor"]
-            print("No categories found, using default: sponsor")
+        from .config_store import normalize_config
+
+        document = {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in config_file_blacklist_keys
+        }
+        # validate() also supports repeated calls without converting offsets twice.
+        document["devices"] = [
+            {**device.__dict__, "offset": device.offset * 1000}
+            if isinstance(device, Device)
+            else device
+            for device in self.devices
+        ]
+        normalized = normalize_config(document)
+        self.__dict__.update(normalized)
+        self.devices = [Device(device) for device in normalized["devices"]]
 
     def __load(self):
-        try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                for i in config:
-                    if i not in config_file_blacklist_keys:
-                        setattr(self, i, config[i])
-        except FileNotFoundError:
-            print(
-                f"No config file found, using defaults. Config will be saved to {self.config_file}"
-            )
-            # Create data directory if it doesn't exist (if we're not running in docker)
-            if not os.path.exists(self.data_dir):
-                if not os.getenv("iSPBTV_docker"):
-                    print("Creating data directory")
-                    os.makedirs(self.data_dir)
-                else:  # Running in docker without mounting the data dir
-                    print(
-                        "Running in docker without mounting the data dir, check the"
-                        " wiki for more information: "
-                        f"{github_wiki_base_url}/Installation#Docker"
-                    )
-                    print(
-                        ("This image has recently been updated to v2, and requires changes."),
-                        ("Please read this for more information on how to upgrade to V2:"),
-                        f"{github_wiki_base_url}/Migrate-from-V1-to-V2",
-                    )
-                    print("Exiting in 10 seconds...")
-                    time.sleep(10)
-                    sys.exit()
-            else:
-                print("Blank config file created")
+        from .config_store import read_config
+
+        self.__dict__.update(read_config(self.config_file))
 
     def save(self):
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            config_dict = self.__dict__
-            # Don't save the config file name
-            config_file = self.config_file
-            data_dir = self.data_dir
-            del config_dict["config_file"]
-            del config_dict["data_dir"]
-            json.dump(config_dict, f, indent=4)
-            self.config_file = config_file
-            self.data_dir = data_dir
+        from .config_store import write_config
+
+        document = {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in config_file_blacklist_keys
+        }
+        document["devices"] = [
+            {**device.__dict__, "offset": device.offset * 1000}
+            if isinstance(device, Device)
+            else device
+            for device in self.devices
+        ]
+        write_config(self.config_file, document)
 
     def __eq__(self, other):
         if isinstance(other, Config):

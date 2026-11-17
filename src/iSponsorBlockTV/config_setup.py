@@ -2,7 +2,8 @@ import asyncio
 
 import aiohttp
 
-from . import api_helpers, ytlounge
+from . import api_helpers
+from .constants import SponsorBlock_api
 
 # Constants for user input prompts
 USE_PROXY_PROMPT = "Do you want to use system-wide proxy? (y/N)"
@@ -17,8 +18,8 @@ ENTER_API_KEY_PROMPT = "Enter your API key: "
 CHANGE_SKIP_CATEGORIES_PROMPT = "Skip categories already specified. Change them? (y/N) "
 ENTER_SKIP_CATEGORIES_PROMPT = (
     "Enter skip categories (space or comma sepparated) Options: [sponsor,"
-    " selfpromo, exclusive_access, interaction, poi_highlight, intro, outro,"
-    " preview, filler, music_offtopic]:\n"
+    " selfpromo, exclusive_access, interaction, intro, outro,"
+    " preview, filler, music_offtopic, hook]:\n"
 )
 WHITELIST_CHANNELS_PROMPT = "Do you want to whitelist any channels from being ad-blocked? (y/N) "
 SEARCH_CHANNEL_PROMPT = 'Enter a channel name or "/exit" to exit: '
@@ -36,6 +37,7 @@ REPORT_SKIPPED_SEGMENTS_PROMPT = (
 MUTE_ADS_PROMPT = "Do you want to mute native YouTube ads automatically? (y/N) "
 SKIP_ADS_PROMPT = "Do you want to skip native YouTube ads automatically? (y/N) "
 AUTOPLAY_PROMPT = "Do you want to enable autoplay? (Y/n) "
+ENTER_SPONSORBLOCK_API_PROMPT = f"Enter SponsorBlock API URL (default: {SponsorBlock_api}): "
 
 
 def get_yn_input(prompt):
@@ -50,22 +52,18 @@ async def create_web_session(use_proxy):
     return aiohttp.ClientSession(trust_env=use_proxy)
 
 
-async def pair_device(web_session: aiohttp.ClientSession):
+async def pair_device(config, web_session: aiohttp.ClientSession, api_helper):
     try:
-        lounge_controller = ytlounge.YtLoungeApi()
-        await lounge_controller.change_web_session(web_session)
+        api_helper = api_helpers.ApiHelper(config, web_session)
         pairing_code = input(PAIRING_CODE_PROMPT)
-        pairing_code = int(
-            pairing_code.replace("-", "").replace(" ", "")
-        )  # remove dashes and spaces
         print("Pairing...")
-        paired = await lounge_controller.pair(pairing_code)
-        if not paired:
-            print("Failed to pair device")
+        paired_device = await api_helper.pair_with_code(pairing_code)
+        if not paired_device:
+            print("Failed to pair device. Try restarting the YouTube app")
             return
         device = {
-            "screen_id": lounge_controller.auth.screen_id,
-            "name": lounge_controller.screen_name,
+            "screen_id": paired_device["screen_id"],
+            "name": paired_device["name"],
         }
         print(f"Paired device: {device['name']}")
         return device
@@ -74,13 +72,16 @@ async def pair_device(web_session: aiohttp.ClientSession):
         return
 
 
+# skipcq: PY-R1000
 def main(config, debug: bool) -> None:
     print("Welcome to the iSponsorBlockTV cli setup wizard")
 
     choice = get_yn_input(USE_PROXY_PROMPT)
     config.use_proxy = choice == "y"
-
-    loop = asyncio.get_event_loop_policy().get_event_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
     web_session = loop.run_until_complete(create_web_session(config.use_proxy))
     if debug:
         loop.set_debug(True)
@@ -96,9 +97,10 @@ def main(config, debug: bool) -> None:
             del config["atvs"]
 
     devices = config.devices
+    api_helper = api_helpers.ApiHelper(config, web_session)
     choice = get_yn_input(ADD_MORE_DEVICES_PROMPT.format(num_devices=len(devices)))
     while choice == "y":
-        device = loop.run_until_complete(pair_device(web_session))
+        device = loop.run_until_complete(pair_device(config, web_session, api_helper))
         if device:
             devices.append(device)
         choice = get_yn_input(ADD_MORE_DEVICES_PROMPT.format(num_devices=len(devices)))
@@ -120,7 +122,7 @@ def main(config, debug: bool) -> None:
     config.apikey = apikey
 
     skip_categories = config.skip_categories
-    if skip_categories:
+    if skip_categories is not None:
         choice = get_yn_input(CHANGE_SKIP_CATEGORIES_PROMPT)
         if choice == "y":
             categories = input(ENTER_SKIP_CATEGORIES_PROMPT)
@@ -210,6 +212,10 @@ def main(config, debug: bool) -> None:
 
     choice = get_yn_input(AUTOPLAY_PROMPT)
     config.auto_play = choice != "n"
+
+    # SponsorBlock API URL
+    api_url = input(ENTER_SPONSORBLOCK_API_PROMPT).strip()
+    config.sponsorblock_api_url = api_url if api_url else SponsorBlock_api
 
     print("Config finished")
     config.save()

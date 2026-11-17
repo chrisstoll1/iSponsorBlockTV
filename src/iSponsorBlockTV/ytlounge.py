@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sys
 from typing import Any, List
@@ -6,12 +7,35 @@ from typing import Any, List
 import pyytlounge
 from aiohttp import ClientSession
 
+from pyytlounge.event_listener import EventListener
+from pyytlounge.events import NowPlayingEvent, PlaybackStateEvent
+from pyytlounge.models import State
 from pyytlounge.wrapper import NotLinkedException, api_base, as_aiter, Dict
 from uuid import uuid4
 
 from .constants import youtube_client_blacklist
 
 create_task = asyncio.create_task
+
+
+class PlaybackState:
+    def __init__(self):
+        self.currentTime = 0.0
+        self.duration = 0.0
+        self.videoId = ""
+        self.state = State.Stopped
+
+
+class _CallbackListener(EventListener):
+    def __init__(self, lounge: "YtLoungeApi"):
+        super().__init__()
+        self._lounge = lounge
+
+    async def playback_state_changed(self, event: PlaybackStateEvent) -> None:
+        await self._lounge._handle_playback_state_event(event)
+
+    async def now_playing_changed(self, event: NowPlayingEvent) -> None:
+        await self._lounge._handle_now_playing_event(event)
 
 
 class YtLoungeApi(pyytlounge.YtLoungeApi):
@@ -22,15 +46,24 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         api_helper=None,
         logger=None,
     ):
-        super().__init__(config.join_name if config else "iSponsorBlockTV", logger=logger)
+        self._callback_listener = _CallbackListener(self)
+        super().__init__(
+            config.join_name if config else "iSponsorBlockTV",
+            event_listener=self._callback_listener,
+            logger=logger,
+        )
         self.auth.screen_id = screen_id
         self.auth.lounge_id_token = None
+        # Unique device_id for iSponsorBlockTV, allows other clients to connect simultaneously
+        self.auth.device_id = hashlib.md5(f"iSponsorBlockTV{screen_id or ''}".encode()).hexdigest()
         self.api_helper = api_helper
         self.volume_state = {}
         self.playback_speed = 1.0
         self.subscribe_task = None
         self.subscribe_task_watchdog = None
         self.callback = None
+        self._state_callback = None
+        self._playback_state = PlaybackState()
         self.logger = logger
         self.shorts_disconnected = False
         self.auto_play = True
@@ -42,6 +75,23 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self.auto_play = config.auto_play
         self._command_mutex = asyncio.Lock()
 
+    async def _handle_playback_state_event(self, event: PlaybackStateEvent) -> None:
+        self._playback_state.currentTime = event.current_time
+        self._playback_state.duration = event.duration
+        self._playback_state.state = event.state
+        if self._state_callback:
+            await self._state_callback(self._playback_state)
+
+    async def _handle_now_playing_event(self, event: NowPlayingEvent) -> None:
+        if event.current_time is not None:
+            self._playback_state.currentTime = event.current_time
+        if event.duration is not None:
+            self._playback_state.duration = event.duration
+        self._playback_state.videoId = event.video_id or ""
+        self._playback_state.state = event.state
+        if self._state_callback:
+            await self._state_callback(self._playback_state)
+
     # Ensures that we still are subscribed to the lounge
     async def _watchdog(self):
         """
@@ -50,12 +100,12 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         it cancels the current subscription.
         """
         self.watchdog_running = True
-        self.last_event_time = asyncio.get_event_loop().time()
+        self.last_event_time = asyncio.get_running_loop().time()
 
         try:
             while self.watchdog_running:
                 await asyncio.sleep(10)
-                current_time = asyncio.get_event_loop().time()
+                current_time = asyncio.get_running_loop().time()
                 time_since_last_event = current_time - self.last_event_time
 
                 # YouTube sends a message at least every 30 seconds
@@ -78,6 +128,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     # Subscribe to the lounge and start the watchdog
     async def subscribe_monitored(self, callback):
         self.callback = callback
+        self._state_callback = callback
 
         # Stop existing watchdog if running
         if self.subscribe_task_watchdog and not self.subscribe_task_watchdog.done():
@@ -96,16 +147,16 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        self.subscribe_task = asyncio.create_task(super().subscribe(callback))
+        self.subscribe_task = asyncio.create_task(super().subscribe())
         self.subscribe_task_watchdog = asyncio.create_task(self._watchdog())
         return self.subscribe_task
 
     # Process a lounge subscription event
     # skipcq: PY-R1000
-    def _process_event(self, event_type: str, args: List[Any]):
+    async def _process_event(self, event_type: str, args: List[Any]):
         self.logger.debug(f"process_event({event_type}, {args})")
         # Update last event time for the watchdog
-        self.last_event_time = asyncio.get_event_loop().time()
+        self.last_event_time = asyncio.get_running_loop().time()
 
         # A bunch of events useful to detect ads playing,
         # and the next video before it starts playing
@@ -124,7 +175,9 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 create_task(self.mute(False, override=True))
         elif event_type == "onAdStateChange":
             data = args[0]
-            if data["adState"] == "0" and data["currentTime"] != "0":  # Ad is not playing
+            if (data["adState"] in {"0", "1082"}) and data[
+                "currentTime"
+            ] != "0":  # Ad is not playing, or has just been skipped (1082)
                 self.logger.info("Ad has ended, unmuting")
                 create_task(self.mute(False, override=True))
             elif (
@@ -173,6 +226,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                     if device_info.get("clientName", "") in youtube_client_blacklist:
                         self._sid = None
                         self._gsession = None  # Force disconnect
+                        return
 
         elif event_type == "onSubtitlesTrackChanged":
             if self.shorts_disconnected:
@@ -191,9 +245,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "onPlaybackSpeedChanged":
             data = args[0]
             self.playback_speed = float(data.get("playbackSpeed", "1"))
-            create_task(self.get_now_playing())
 
-        super()._process_event(event_type, args)
+        await super()._process_event(event_type, args)
 
     # Set the volume to a specific value (0-100)
     async def set_volume(self, volume: int) -> None:
@@ -260,7 +313,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             raise NotLinkedException("Not linked")
 
         connect_body = {
-            "id": self.auth.screen_id,
+            "id": self.auth.device_id,
             "mdx-version": "3",
             "TYPE": "xmlhttp",
             "theme": "cl",
@@ -295,7 +348,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                     return False
                 lines = text.splitlines()
                 async for events in self._parse_event_chunks(as_aiter(lines)):
-                    self._process_events(events)
+                    await self._process_events(events)
                 self._command_offset = 1
                 return self.connected()
             except:

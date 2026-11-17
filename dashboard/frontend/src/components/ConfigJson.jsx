@@ -22,6 +22,9 @@ export function ConfigJson({ config, replaceConfig }) {
     const applyJson = (nextJson) => {
         try {
             const parsed = JSON.parse(nextJson)
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Configuration must be a JSON object')
+            }
             replaceConfig(parsed)
             setJsonValue(formatConfig(parsed))
             setIsDirty(false)

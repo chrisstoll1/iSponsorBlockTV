@@ -1,205 +1,182 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-import json
+"""Authenticated configuration dashboard, sharing the worker's configuration format."""
+
+import base64
+import binascii
+import hmac
 import os
+import re
 import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
 import aiohttp
-import traceback
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
-sys.path.append("/app/src")
-try:
-    from iSponsorBlockTV.ytlounge import YtLoungeApi
-except ImportError:
-    try:
-        sys.path.append(os.path.join(os.path.dirname(__file__), "../../src"))
-        from iSponsorBlockTV.ytlounge import YtLoungeApi
-    except ImportError:
-        print("Warning: Could not import YtLoungeApi. Pairing will fail.")
-        YtLoungeApi = None
-
-try:
-    from iSponsorBlockTV.api_helpers import ApiHelper
-    from iSponsorBlockTV.helpers import Config
-except ImportError:
-    print("Error importing ApiHelper or Config:")
-    traceback.print_exc()
-    ApiHelper = None
-    Config = None
-
-app = FastAPI()
-
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/data/config.json")
-
-DEFAULT_CONFIG = {
-    "devices": [],
-    "apikey": "",
-    "skip_categories": ["sponsor"],
-    "channel_whitelist": [],
-    "skip_count_tracking": True,
-    "mute_ads": False,
-    "skip_ads": False,
-    "minimum_skip_length": 1,
-    "auto_play": True,
-    "join_name": "iSponsorBlockTV",
-    "use_proxy": False,
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from iSponsorBlockTV.api_helpers import ApiHelper
+from iSponsorBlockTV.config_store import read_config, write_config
 
 
-def normalize_config(config: Optional[dict]):
-    config = config or {}
-    normalized = {**DEFAULT_CONFIG, **config}
-
-    for key in ["devices", "skip_categories", "channel_whitelist"]:
-        if normalized.get(key) is None:
-            normalized[key] = DEFAULT_CONFIG[key]
-
-    for key in ["apikey", "join_name"]:
-        if normalized.get(key) is None:
-            normalized[key] = DEFAULT_CONFIG[key]
-
-    for key in ["skip_count_tracking", "mute_ads", "skip_ads", "auto_play", "use_proxy"]:
-        if key not in config or config.get(key) is None:
-            normalized[key] = DEFAULT_CONFIG[key]
-
-    if normalized.get("minimum_skip_length") is None:
-        normalized["minimum_skip_length"] = DEFAULT_CONFIG["minimum_skip_length"]
-
-    return normalized
+class PairRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: StrictStr = Field(min_length=1, max_length=64)
+    name: StrictStr = Field(default="", max_length=4096)
+    offset: StrictInt = 0
 
 
-@app.get("/api/config")
-def get_config():
-    if not os.path.exists(CONFIG_PATH):
-        if os.path.exists("/app/config.json.template"):
-            with open("/app/config.json.template", "r") as f:
-                return normalize_config(json.load(f))
-        return normalize_config({})
+def create_app(config_path=None, static_dir=None, password=None, password_file=None):
+    config_path = Path(config_path or os.environ.get("CONFIG_PATH", "/app/data/config.json"))
+    static_dir = Path(static_dir or os.environ.get("STATIC_DIR", "/app/static")).resolve()
 
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            config = json.load(f)
-        return normalize_config(config)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    @asynccontextmanager
+    async def lifespan(app):
+        configured_file = password_file or os.environ.get("DASHBOARD_PASSWORD_FILE")
+        secret = password if password is not None else os.environ.get("DASHBOARD_PASSWORD")
+        if configured_file:
+            secret = Path(configured_file).read_text(encoding="utf-8").rstrip("\r\n")
+        if not secret:
+            raise RuntimeError("Set DASHBOARD_PASSWORD or DASHBOARD_PASSWORD_FILE before starting")
+        app.state.password = secret.encode("utf-8")
+        app.state.username = os.environ.get("DASHBOARD_USERNAME", "admin").encode("utf-8")
+        yield
 
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
-@app.post("/api/config")
-def update_config(config: dict):
-    try:
-        normalized_config = normalize_config(config)
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(normalized_config, f, indent=4)
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-app.mount("/assets", StaticFiles(directory="/app/static/assets"), name="assets")
-
-
-@app.post("/api/pair")
-async def pair_device(data: dict):
-    code = data.get("code")
-    name = data.get("name")
-    offset = data.get("offset", 0)
-
-    if not code:
-        raise HTTPException(status_code=400, detail="Pairing code required")
-
-    try:
-        try:
-            pairing_code = int(str(code).replace("-", "").replace(" ", ""))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid pairing code format. Digits only.")
-
-        try:
-            offset = int(offset)
-        except (ValueError, TypeError):
-            offset = 0
-
-        async with aiohttp.ClientSession() as session:
-            api = YtLoungeApi(screen_id=None, config=None, api_helper=None)
-            await api.change_web_session(session)
-
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next):
+        if request.url.path != "/health":
             try:
-                paired = await api.pair(pairing_code)
-            except Exception as e:
-                err_msg = str(e)
-                if "404" in err_msg:
-                    raise HTTPException(
-                        status_code=400, detail="Invalid pairing code or code expired."
-                    )
-                raise e
+                scheme, encoded = request.headers.get("authorization", "").split(" ", 1)
+                if scheme.lower() != "basic":
+                    raise ValueError()
+                user, secret = base64.b64decode(encoded, validate=True).split(b":", 1)
+                valid = hmac.compare_digest(user, request.app.state.username)
+                valid &= hmac.compare_digest(secret, request.app.state.password)
+            except (ValueError, binascii.Error):
+                valid = False
+            if not valid:
+                return Response(
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": 'Basic realm="iSponsorBlockTV", charset="UTF-8"',
+                        "Cache-Control": "no-store",
+                    },
+                )
+            origin = request.headers.get("origin")
+            if (
+                request.method not in ("GET", "HEAD", "OPTIONS")
+                and origin
+                and urlsplit(origin).netloc != request.headers.get("host")
+            ):
+                return JSONResponse(
+                    {"detail": "Cross-origin writes are not permitted"}, status_code=403
+                )
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    def load_config():
+        try:
+            return read_config(config_path)
+        except (ValueError, TypeError):
+            raise HTTPException(409, "Stored configuration is invalid; restore a valid config.json")
+        except OSError:
+            raise HTTPException(500, "Cannot read the configuration directory")
+
+    @app.get("/api/config")
+    def get_config():
+        return load_config()
+
+    @app.post("/api/config")
+    def update_config(config: dict):
+        try:
+            saved = write_config(config_path, config)
+            return {"status": "success", "config": saved}
+        except (ValueError, TypeError) as error:
+            raise HTTPException(422, str(error))
+        except OSError:
+            raise HTTPException(500, "Cannot write the configuration directory")
+
+    @app.post("/api/pair")
+    async def pair_device(data: PairRequest):
+        code = data.code.replace("-", "").replace(" ", "")
+        if not re.fullmatch(r"[0-9]{12}", code):
+            raise HTTPException(
+                422, "Enter the 12-digit code from YouTube Settings ? Link with TV code"
+            )
+        config = SimpleNamespace(**load_config())
+        try:
+            async with aiohttp.ClientSession(
+                trust_env=config.use_proxy, timeout=aiohttp.ClientTimeout(total=20)
+            ) as session:
+                paired = await ApiHelper(config, session).pair_with_code(code)
             if not paired:
                 raise HTTPException(
-                    status_code=400, detail="Pairing failed. Check code and try again."
+                    400, "Pairing code is invalid or expired. Request a new TV code."
                 )
-
             return {
-                "name": name if name else api.screen_name,
-                "screen_id": api.auth.screen_id,
-                "offset": offset,
+                "name": data.name or paired["name"] or "YouTube on TV",
+                "screen_id": paired["screen_id"],
+                "offset": data.offset,
             }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Pairing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+        except (aiohttp.ClientError, TimeoutError):
+            raise HTTPException(502, "YouTube could not be reached. Try again shortly.")
 
-
-@app.get("/api/channels/search")
-async def search_channels(query: str):
-    if not query:
-        return []
-
-    current_apikey = None
-    if os.path.exists(CONFIG_PATH):
+    @app.get("/api/channels/search")
+    async def search_channels(query: str = ""):
+        if not query.strip():
+            return []
+        if len(query) > 200:
+            raise HTTPException(422, "Search must be at most 200 characters")
+        config = SimpleNamespace(**load_config())
+        if not config.apikey:
+            raise HTTPException(400, "Save a YouTube API key before searching for channels")
         try:
-            with open(CONFIG_PATH, "r") as f:
-                config_data = json.load(f)
-                current_apikey = config_data.get("apikey")
-        except Exception:
-            pass
+            async with aiohttp.ClientSession(
+                trust_env=config.use_proxy, timeout=aiohttp.ClientTimeout(total=20)
+            ) as session:
+                results = await ApiHelper(config, session).search_channels(query)
+            return [
+                {"id": result[0], "name": result[1], "subscribers": result[2]} for result in results
+            ]
+        except ValueError:
+            raise HTTPException(
+                400, "YouTube rejected the search. Check the saved API key and quota."
+            )
+        except (aiohttp.ClientError, TimeoutError, KeyError, IndexError):
+            raise HTTPException(502, "Channel search is unavailable. Try again shortly.")
 
-    if not current_apikey:
-        raise HTTPException(status_code=400, detail="API Key is missing from backend config")
+    # StaticFiles handles path containment and symlinks; the fallback serves only index.html.
+    if (static_dir / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=static_dir / "assets"), name="assets")
 
-    if not ApiHelper:
-        raise HTTPException(
-            status_code=500, detail="Backend not properly initialized (ApiHelper missing)"
-        )
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(404)
+        target = (static_dir / full_path).resolve()
+        if not target.is_relative_to(static_dir):
+            raise HTTPException(404)
+        if target.is_file():
+            return FileResponse(target)
+        if "." in Path(full_path).name:
+            raise HTTPException(404)
+        index = static_dir / "index.html"
+        if not index.is_file():
+            raise HTTPException(503, "Dashboard assets are unavailable")
+        return FileResponse(index)
 
-    class MockConfig:
-        def __init__(self, key):
-            self.apikey = key
-            self.skip_categories = []
-            self.channel_whitelist = []
-            self.skip_count_tracking = False
-            self.devices = []
-            self.minimum_skip_length = 0
-
-    mock_config = MockConfig(current_apikey)
-
-    async with aiohttp.ClientSession() as session:
-        api = ApiHelper(mock_config, session)
-        try:
-            results = await api.search_channels(query)
-            formatted_results = [{"id": r[0], "name": r[1], "subscribers": r[2]} for r in results]
-            return formatted_results
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            print(f"Search error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+    return app
 
 
-@app.get("/{full_path:path}")
-async def serve_react_app(full_path: str):
-    if full_path.startswith("api"):
-        raise HTTPException(status_code=404)
-    if os.path.exists(f"/app/static/{full_path}") and full_path != "":
-        return FileResponse(f"/app/static/{full_path}")
-    return FileResponse("/app/static/index.html")
+app = create_app()

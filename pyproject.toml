@@ -1,12 +1,12 @@
 [project]
 name = "iSponsorBlockTV"
-version = "2.6.1"
+version = "2.11.1"
 authors = [
     {"name" = "dmunozv04"}
 ]
 description = "SponsorBlock client for all YouTube TV clients"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
@@ -31,3 +31,7 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

@@ -1,30 +1,27 @@
-# Build Frontend
+# syntax=docker/dockerfile:1
 FROM node:22-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY dashboard/frontend/package*.json ./
-RUN npm install
-COPY dashboard/frontend/ .
+RUN npm ci
+COPY dashboard/frontend/index.html dashboard/frontend/vite.config.js ./
+COPY dashboard/frontend/src ./src
+# Copy only the intended asset, never arbitrary local public files.
+COPY dashboard/frontend/public/LogoSponsorBlocker256px.png ./public/LogoSponsorBlocker256px.png
 RUN npm run build
 
-# Setup Backend
 FROM python:3.13-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src HOME=/tmp
 WORKDIR /app
-
-# Install dependencies
-COPY dashboard/backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy backend code
-COPY dashboard/backend/ .
-
-# Copy project source for reuse
+COPY requirements.txt /app/requirements.txt
+COPY dashboard/backend/requirements.txt /app/dashboard-requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -r dashboard-requirements.txt
 COPY src /app/src
-
-# Copy built frontend assets
+COPY dashboard/backend/main.py /app/dashboard/backend/main.py
+COPY LICENSE.md /app/LICENSE.md
 COPY --from=frontend-builder /app/frontend/dist /app/static
-
-# Expose port
+RUN mkdir -p /app/data && chown 568:568 /app/data
+USER 568:568
 EXPOSE 8080
-
-# Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+CMD ["uvicorn", "dashboard.backend.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

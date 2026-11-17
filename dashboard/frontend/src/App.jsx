@@ -49,9 +49,14 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(configToSave)
       })
-      if (!res.ok) throw new Error('Failed to save config')
+      if (!res.ok) {
+        const error = await res.json()
+        throw new Error(typeof error.detail === 'string' ? error.detail : 'Invalid configuration')
+      }
+      const saved = await res.json()
+      setConfig(saved.config)
       toast.success('Configuration saved successfully!')
-      setOriginalConfig(JSON.parse(JSON.stringify(config)))
+      setOriginalConfig(JSON.parse(JSON.stringify(saved.config)))
     } catch (err) {
       toast.error(err.message)
     } finally {

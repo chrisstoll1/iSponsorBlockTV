@@ -1,38 +1,19 @@
 import asyncio
 import logging
+import os
 import time
-
+from pathlib import Path
 from signal import SIGINT, SIGTERM, signal
-from typing import Optional
 
 import aiohttp
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 from . import api_helpers, ytlounge
 from .debug_helpers import AiohttpTracer
 
 
-class ConfigChangeHandler(FileSystemEventHandler):
-    def __init__(self, loop, reload_event, config):
-        self.loop = loop
-        self.reload_event = reload_event
-        self.config = config
-        self.last_reload = 0
-
-    def on_modified(self, event):
-        if event.src_path.endswith("config.json"):
-            current_time = time.time()
-            if current_time - self.last_reload < 5:  # Debounce
-                return
-            self.last_reload = current_time
-            print("Config change detected, reloading...")
-            self.loop.call_soon_threadsafe(self.reload_event.set)
-
-
 class DeviceListener:
     def __init__(self, api_helper, config, device, debug: bool, web_session):
-        self.task: Optional[asyncio.Task] = None
+        self.task: asyncio.Task | None = None
         self.api_helper = api_helper
         self.offset = device.offset
         self.name = device.name
@@ -49,13 +30,13 @@ class DeviceListener:
             await asyncio.sleep(60 * 60 * 24)  # Refresh every 24 hours
             try:
                 await self.lounge_controller.refresh_auth()
-            except BaseException:
-                pass
+            except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
+                self.logger.debug("TV request failed; retrying when available")
 
     async def is_available(self):
         try:
             return await self.lounge_controller.is_available()
-        except BaseException:
+        except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
             return False
 
     # Main subscription loop
@@ -66,23 +47,23 @@ class DeviceListener:
                 try:
                     self.logger.debug("Refreshing auth")
                     await lounge_controller.refresh_auth()
-                except BaseException:
+                except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
                     await asyncio.sleep(10)
             while not (await self.is_available()) and not self.cancelled:
                 self.logger.debug("Waiting for device to be available")
                 await asyncio.sleep(10)
             try:
                 await lounge_controller.connect()
-            except BaseException:
-                pass
+            except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
+                self.logger.debug("TV request failed; retrying when available")
             while not lounge_controller.connected() and not self.cancelled:
                 # Doesn't connect to the device if it's a kids profile (it's broken)
                 self.logger.debug("Waiting for device to be connected")
                 await asyncio.sleep(10)
                 try:
                     await lounge_controller.connect()
-                except BaseException:
-                    pass
+                except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
+                    self.logger.debug("TV connection failed; retrying")
             self.logger.info(
                 "Connected to device %s (%s)", lounge_controller.screen_name, self.name
             )
@@ -90,16 +71,14 @@ class DeviceListener:
                 self.logger.debug("Subscribing to lounge")
                 sub = await lounge_controller.subscribe_monitored(self)
                 await sub
-            except BaseException:
-                pass
+            except Exception:  # noqa: BLE001 - Third-party TV failures must not block reconnection.
+                self.logger.debug("TV request failed; retrying when available")
 
     # Method called on playback state change
     async def __call__(self, state):
         time_start = time.monotonic()
-        try:
+        if self.task is not None:
             self.task.cancel()
-        except BaseException:
-            pass
         self.task = asyncio.create_task(self.process_playstatus(state, time_start))
 
     # Processes the playback state change
@@ -153,107 +132,134 @@ class DeviceListener:
             self.lounge_controller.subscribe_task_watchdog.cancel()
         if self.lounge_controller.subscribe_task:
             self.lounge_controller.subscribe_task.cancel()
-        await asyncio.gather(
-            self.task,
-            self.lounge_controller.subscribe_task_watchdog,
-            self.lounge_controller.subscribe_task,
-            return_exceptions=True,
-        )
+        pending = [
+            task
+            for task in (
+                self.task,
+                self.lounge_controller.subscribe_task_watchdog,
+                self.lounge_controller.subscribe_task,
+            )
+            if task is not None
+        ]
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def initialize_web_session(self):
         await self.lounge_controller.change_web_session(self.web_session)
 
 
-async def finish(devices, web_session, tcp_connector):
-    await asyncio.gather(*(device.cancel() for device in devices), return_exceptions=True)
-    if web_session:
-        await web_session.close()
-    if tcp_connector:
-        await tcp_connector.close()
+async def wait_for_config(config, interval=0.5):
+    """Keep the current listeners until a complete, valid replacement is available."""
+    from .helpers import Config
+
+    logger = logging.getLogger(__name__)
+    previous = None
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            content = Path(config.config_file).read_bytes()
+            if content == previous:
+                continue
+            previous = content
+            candidate = Config(config.data_dir)
+            candidate.validate()
+            if candidate != config:
+                return candidate
+        except (OSError, ValueError, TypeError):
+            logger.warning(
+                "Configuration update is invalid or unreadable; keeping current settings"
+            )
 
 
-def handle_signal(signum, frame):
-    raise KeyboardInterrupt()
+async def run_listeners(config, debug, http_tracing, stop):
+    loop = asyncio.get_running_loop()
+    loop.set_debug(debug)
+    tasks = []
+    devices = []
+    trace_configs = []
+    if http_tracing:
+        tracer = AiohttpTracer(logging.getLogger("aiohttp_trace"))
+        trace = aiohttp.TraceConfig()
+        trace.on_request_start.append(tracer.on_request_start)
+        trace.on_response_chunk_received.append(tracer.on_response_chunk_received)
+        trace.on_request_end.append(tracer.on_request_end)
+        trace.on_request_exception.append(tracer.on_request_exception)
+        trace_configs.append(trace)
+
+    async with aiohttp.ClientSession(
+        trust_env=config.use_proxy,
+        connector=aiohttp.TCPConnector(ttl_dns_cache=300),
+        trace_configs=trace_configs,
+    ) as web_session:
+        reload_task = asyncio.create_task(wait_for_config(config))
+        stop_task = asyncio.create_task(stop.wait())
+        try:
+            api_helper = api_helpers.ApiHelper(config, web_session)
+            for entry in config.devices:
+                device = DeviceListener(api_helper, config, entry, debug, web_session)
+                devices.append(device)
+                await device.initialize_web_session()
+                tasks.extend(
+                    [
+                        asyncio.create_task(device.loop()),
+                        asyncio.create_task(device.refresh_auth_loop()),
+                    ]
+                )
+            done, _ = await asyncio.wait(
+                [reload_task, stop_task, *tasks], return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop_task in done:
+                return None
+            if reload_task in done:
+                logging.getLogger(__name__).info("Applying updated configuration")
+                return reload_task.result()
+            for task in done:
+                task.result()
+            raise RuntimeError("A device listener stopped unexpectedly")
+        finally:
+            for task in [reload_task, stop_task, *tasks]:
+                task.cancel()
+            await asyncio.gather(reload_task, stop_task, *tasks, return_exceptions=True)
+            cleanup = asyncio.gather(
+                *(device.cancel() for device in devices), return_exceptions=True
+            )
+            try:
+                await asyncio.wait_for(cleanup, timeout=5)
+            except TimeoutError:
+                logging.getLogger(__name__).warning("Timed out disconnecting devices")
+
+
+async def heartbeat():
+    path = Path(os.environ.get("HEALTHCHECK_PATH", "/tmp/isponsorblocktv-health"))
+    while True:
+        path.touch()
+        await asyncio.sleep(5)
 
 
 async def main_async(config, debug, http_tracing):
     loop = asyncio.get_running_loop()
-
-    reload_event = asyncio.Event()
-    config_dir = config.data_dir
-    event_handler = ConfigChangeHandler(loop, reload_event, config)
-    observer = Observer()
-    observer.schedule(event_handler, config_dir, recursive=False)
-    observer.start()
-
-    signal(SIGTERM, handle_signal)
-    signal(SIGINT, handle_signal)
-
-    while True:
-        try:
-            config._Config__load()
-            config.validate()
-        except Exception as e:
-            print(f"Error reloading config: {e}")
-
-        tasks = []
-        devices = []
-        tcp_connector = aiohttp.TCPConnector(ttl_dns_cache=300)
-
-        # Configure session with tracing if enabled
-        if http_tracing:
-            root_logger = logging.getLogger("aiohttp_trace")
-            tracer = AiohttpTracer(root_logger)
-            trace_config = aiohttp.TraceConfig()
-            trace_config.on_request_start.append(tracer.on_request_start)
-            trace_config.on_response_chunk_received.append(tracer.on_response_chunk_received)
-            trace_config.on_request_end.append(tracer.on_request_end)
-            trace_config.on_request_exception.append(tracer.on_request_exception)
-            web_session = aiohttp.ClientSession(
-                trust_env=config.use_proxy, connector=tcp_connector, trace_configs=[trace_config]
-            )
-        else:
-            web_session = aiohttp.ClientSession(trust_env=config.use_proxy, connector=tcp_connector)
-
-        api_helper = api_helpers.ApiHelper(config, web_session)
-
-        for i in config.devices:
-            device = DeviceListener(api_helper, config, i, debug, web_session)
-            devices.append(device)
-            await device.initialize_web_session()
-            tasks.append(loop.create_task(device.loop()))
-            tasks.append(loop.create_task(device.refresh_auth_loop()))
-
-        reload_waiter = loop.create_task(reload_event.wait())
-
-        try:
-            done, pending = await asyncio.wait(
-                tasks + [reload_waiter], return_when=asyncio.FIRST_COMPLETED
-            )
-
-            if reload_waiter in done:
-                print("Reloading invoked. Stopping current tasks...")
-            else:
-                print("Tasks finished unexpectedly. Restarting...")
-
-        except KeyboardInterrupt:
-            print("Stopping...")
-            observer.stop()
-            observer.join()
-            await finish(devices, web_session, tcp_connector)
-            for task in tasks:
-                task.cancel()
-            return  # Exit main loop
-
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-
-        await finish(devices, web_session, tcp_connector)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        reload_event.clear()
+    stop = asyncio.Event()
+    health_task = asyncio.create_task(heartbeat())
+    previous_handlers = {}
+    for signum in (SIGTERM, SIGINT):
+        previous_handlers[signum] = signal(signum, lambda *_: loop.call_soon_threadsafe(stop.set))
+    try:
+        while not stop.is_set():
+            try:
+                candidate = await run_listeners(config, debug, http_tracing, stop)
+                if candidate is None:
+                    break
+                config = candidate
+            except Exception:
+                logging.getLogger(__name__).exception("Listener failed; retrying in five seconds")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+    finally:
+        health_task.cancel()
+        await asyncio.gather(health_task, return_exceptions=True)
+        for signum, handler in previous_handlers.items():
+            signal(signum, handler)
 
 
 def main(config, debug, http_tracing):

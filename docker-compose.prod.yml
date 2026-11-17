@@ -1,19 +1,26 @@
 services:
-  iSponsorBlockTV:
-    image: ghcr.io/dmunozv04/isponsorblocktv:latest
-    container_name: iSponsorBlockTV
+  worker:
+    image: ghcr.io/chrisstoll1/isponsorblocktv:v2.11.1
     restart: unless-stopped
+    user: "${PUID:-568}:${PGID:-568}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
     volumes:
       - ./data:/app/data
-
   dashboard:
-    image: ghcr.io/dmunozv04/isponsorblocktv-dashboard:latest
-    container_name: iSponsorBlockTV-dashboard
+    image: ghcr.io/chrisstoll1/isponsorblocktv-dashboard:v2.11.1
     restart: unless-stopped
+    user: "${PUID:-568}:${PGID:-568}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
     ports:
-      - "8080:8080"
+      - "${DASHBOARD_BIND_IP:-127.0.0.1}:${DASHBOARD_PORT:-8080}:8080"
+    environment:
+      DASHBOARD_USERNAME: "${DASHBOARD_USERNAME:-admin}"
+      DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:?Set DASHBOARD_PASSWORD in .env}"
     volumes:
       - ./data:/app/data
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - iSponsorBlockTV
